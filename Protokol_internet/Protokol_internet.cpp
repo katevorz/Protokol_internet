@@ -3,53 +3,35 @@
 #include <vector>
 #include <regex>
 #include <windows.h>
-using namespace std;
+#include <sstream>
+#include <algorithm>
 
-void setConsoleToUTF8() {
+using namespace std;
+void initConsole() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    setlocale(LC_ALL, "Russian");
 }
 
-// Функция для выполнения системной команды и получения вывода
-vector<string> executeCommand(const wstring& command) {
+vector<string> executeCommand(const string& cmd) {
     vector<string> output;
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
 
     HANDLE hReadPipe, hWritePipe;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        cerr << "CreatePipe failed!" << endl;
         return output;
     }
 
-    STARTUPINFO si;
+    STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.hStdError = hWritePipe;
     si.hStdOutput = hWritePipe;
-    si.dwFlags |= STARTF_USESTDHANDLES;
-    ZeroMemory(&pi, sizeof(pi));
+    si.hStdError = hWritePipe;
+    si.dwFlags = STARTF_USESTDHANDLES;
 
-    // Преобразуем команду в широкую строку (LPWSTR)
-    wchar_t* cmd = const_cast<wchar_t*>(command.c_str());
+    string command = "cmd.exe /c " + cmd + " 2>nul";
 
-    if (!CreateProcess(
-        NULL, // Приложение
-        cmd,  // Командная строка
-        NULL, // Атрибуты процесса
-        NULL, // Атрибуты потока
-        TRUE, // Наследование дескрипторов
-        0,    // Флаги создания
-        NULL, // Окружение
-        NULL, // Текущий каталог
-        &si,  // STARTUPINFO
-        &pi   // PROCESS_INFORMATION
-    )) {
-        DWORD error = GetLastError();
-        cerr << "CreateProcess failed! Error code: " << error << endl;
+    if (!CreateProcessA(NULL, (LPSTR)command.c_str(), NULL, NULL, TRUE,
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
         return output;
@@ -57,10 +39,20 @@ vector<string> executeCommand(const wstring& command) {
 
     CloseHandle(hWritePipe);
 
-    char buffer[128];
+    char buffer[4096];
     DWORD bytesRead;
+    string result;
+
     while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
-        output.push_back(string(buffer, bytesRead));
+        result.append(buffer, bytesRead);
+    }
+
+    stringstream ss(result);
+    string line;
+    while (getline(ss, line)) {
+        if (!line.empty()) {
+            output.push_back(line);
+        }
     }
 
     CloseHandle(hReadPipe);
@@ -70,44 +62,120 @@ vector<string> executeCommand(const wstring& command) {
     return output;
 }
 
-// Функция для получения номера автономной системы по IP-адресу
-string getASNumber(const string& ip) {
-    // Используем whois для получения информации об IP-адресе
-    wstring command = L"whois " + wstring(ip.begin(), ip.end()) + L" | findstr \"origin:\"";
-    auto output = executeCommand(command);
-    if (!output.empty()) {
-        return output[0];
+/*
+Проверка, является ли IP-адрес приватным (внутренним)
+ @param ip Проверяемый IP-адрес
+ @return true если адрес приватный, false если публичный
+ */
+bool isPrivateIP(const string& ip) {
+    try {
+        // проверка приватных IP
+        if (ip.compare(0, 3, "10.") == 0 ||
+            ip.compare(0, 4, "172.") == 0 ||
+            ip.compare(0, 8, "192.168.") == 0 ||
+            ip.compare(0, 4, "127.") == 0 ||
+            ip.compare(0, 8, "169.254.") == 0) {
+            return true;
+        }
+
+        //проверка для 172.16-31.x.x
+        if (ip.compare(0, 4, "172.") == 0) {
+            size_t pos = ip.find('.', 4);
+            if (pos != string::npos) {
+                int second = stoi(ip.substr(4, pos - 4));
+                if (second >= 16 && second <= 31) {
+                    return true;
+                }
+            }
+        }
     }
+    catch (...) {
+        // В случае ошибки считаем IP не приватным
+        return false;
+    }
+    return false;
+}
+
+/*
+ Получение номера автономной системы (AS) для IP-адреса
+ @param ip IP-адрес для проверки
+ @return Строка с номером AS или "Private"/"Unknown"
+ */
+string getASNumber(const string& ip) {
+    if (isPrivateIP(ip)) {
+        return "Private";
+    }
+
+    try {
+        auto whoisOutput = executeCommand("whois " + ip);
+        regex asPattern(R"(origin:\s*AS(\d+))", regex_constants::icase);
+        smatch match;
+
+        for (const auto& line : whoisOutput) {
+            if (regex_search(line, match, asPattern)) {
+                return "AS" + match[1].str();
+            }
+        }
+    }
+    catch (const regex_error& e) {
+        cerr << "Ошибка регулярного выражения: " << e.what() << endl;
+    }
+    catch (...) {
+        cerr << "Неизвестная ошибка при обработке whois" << endl;
+    }
+
     return "Unknown";
 }
 
 int main() {
-    setConsoleToUTF8();
-    setlocale(0, "");
+    initConsole();
 
-    string domain;
-    cout << "Введите доменное имя или IP-адрес: ";
-    cin >> domain;
+    cout << "Трассировка автономных систем" << endl;
+    cout << "Введите домен или IP: ";
 
-    // Выполняем команду tracert
-    wstring command = L"tracert " + wstring(domain.begin(), domain.end());
-    auto tracertOutput = executeCommand(command);
+    string target;
+    getline(cin, target);
+    if (target.empty()) {
+        target = "google.com";
+    }
 
-    // Регулярное выражение для поиска IP-адресов
-    regex ipRegex(R"((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}))");
-    smatch match;
+    try {
+        auto tracertResult = executeCommand("tracert -d " + target);
+        regex ipRegex(R"((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}))");
+        vector<string> ipList;
 
-    // Выводим заголовок таблицы
-    cout << "| № по порядку | IP    | AS    |\n";
-    cout << "|---|---|---|\n";
-
-    int count = 1;
-    for (const auto& line : tracertOutput) {
-        if (regex_search(line, match, ipRegex)) {
-            string ip = match.str(0);
-            string asNumber = getASNumber(ip);
-            cout << "| " << count++ << " | " << ip << " | " << asNumber << " |\n";
+        for (const auto& line : tracertResult) {
+            smatch match;
+            if (regex_search(line, match, ipRegex)) {
+                string ip = match[0];
+                if (find(ipList.begin(), ipList.end(), ip) == ipList.end()) {
+                    ipList.push_back(ip);
+                }
+            }
         }
+
+        cout << "\n+-----+-----------------+---------------+" << endl;
+        cout << "|  №  | IP-адрес        | AS номер      |" << endl;
+        cout << "+-----+-----------------+---------------+" << endl;
+
+        for (size_t i = 0; i < ipList.size(); ++i) {
+            string asNumber = getASNumber(ipList[i]);
+            cout << "| " << i + 1 << "\t| " << ipList[i] << "\t| " << asNumber << "\t|" << endl;
+        }
+
+        cout << "+-----+-----------------+---------------+" << endl;
+    }
+    catch (const regex_error& e) {
+        cerr << "Ошибка в регулярном выражении: " << e.what() << endl;
+        return 1;
+    }
+    catch (const exception& e) {
+        cerr << "Ошибка: " << e.what() << endl;
+        return 1;
+    }
+    catch (...) {
+        cerr << "Неизвестная ошибка" << endl;
+        return 1;
     }
 
     return 0;
